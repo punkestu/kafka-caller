@@ -12,7 +12,8 @@ use tauri::{generate_handler, Manager, State, Window};
 
 struct AppState {
     producer: Mutex<Producer>,
-    hosts: RwLock<Vec<String>>,
+    hosts: RwLock<String>,
+    topic: RwLock<String>,
     cancel: Arc<RwLock<bool>>,
 }
 
@@ -23,9 +24,9 @@ async fn start_consumer(
     topic: String,
 ) -> Result<(), String> {
     let mut consumer: Consumer;
-    match Consumer::from_hosts(state.hosts.read().unwrap().clone())
+    match Consumer::from_hosts(vec![state.hosts.read().unwrap().clone()])
         .with_group("test-group".to_owned())
-        .with_topic(topic)
+        .with_topic(topic.clone())
         .with_fallback_offset(FetchOffset::Earliest)
         .with_offset_storage(Some(kafka::consumer::GroupOffsetStorage::Kafka))
         .create()
@@ -35,22 +36,26 @@ async fn start_consumer(
     }
     let cancel = state.cancel.clone();
     *state.cancel.write().unwrap() = false;
-    thread::spawn(move || loop {
-        if cancel.read().unwrap().to_owned() {
-            break;
-        }
-        for ms in consumer.poll().unwrap().iter() {
-            for m in ms.messages() {
-                let _ = window.emit(
-                    "kafka_message",
-                    str::from_utf8(m.value).unwrap().to_string(),
-                );
+    *state.topic.write().unwrap() = topic;
+    thread::spawn(move || {
+        loop {
+            if cancel.read().unwrap().to_owned() {
+                break;
+            }
+            for ms in consumer.poll().unwrap().iter() {
+                for m in ms.messages() {
+                    let _ = window.emit(
+                        "kafka_message",
+                        str::from_utf8(m.value).unwrap().to_string(),
+                    );
+                }
+
+                consumer.consume_messageset(ms).unwrap();
             }
 
-            consumer.consume_messageset(ms).unwrap();
+            consumer.commit_consumed().unwrap();
         }
-
-        consumer.commit_consumed().unwrap();
+        println!("consumer thread finished");
     });
     Ok(())
 }
@@ -62,21 +67,32 @@ fn stop_consumer(state: State<'_, AppState>) {
 
 #[tauri::command]
 fn produce(state: State<'_, AppState>, message: String) {
-    let record = Record::from_value("test-topic", message.as_str());
+    let topic = state.topic.read().unwrap().clone();
+    let record = Record::from_value(topic.as_str(), message.as_str());
     state.producer.lock().unwrap().send(&record).unwrap();
 }
 
 #[tauri::command]
-fn setup_kafka(state: State<'_, AppState>, hosts: Vec<String>) {
-    state.hosts.write().unwrap().clone_from(&hosts);
+fn set_broker(state: State<'_, AppState>, broker: String) -> Result<(), String> {
+    state.hosts.write().unwrap().clone_from(&broker);
     let mut producer = state.producer.lock().unwrap();
-    *producer = Producer::from_hosts(hosts).create().unwrap();
+    if let Ok(new_producer) = Producer::from_hosts(vec![broker]).create() {
+        *producer = new_producer;
+        Ok(())
+    } else {
+        Err("Failed to create producer".to_string())
+    }
+}
+
+#[tauri::command]
+fn get_broker(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(state.hosts.read().unwrap().clone())
 }
 
 fn main() {
-    let hosts = RwLock::from(vec!["localhost:9092".to_owned()]);
+    let hosts = RwLock::from("localhost:9092".to_string());
     let producer = Mutex::from(
-        Producer::from_hosts(hosts.read().unwrap().clone())
+        Producer::from_hosts(vec![hosts.read().unwrap().clone()])
             .create()
             .unwrap(),
     );
@@ -84,6 +100,7 @@ fn main() {
         .manage(AppState {
             producer,
             hosts,
+            topic: RwLock::from("".to_string()),
             cancel: Arc::new(RwLock::new(false)),
         })
         .setup(|app| {
@@ -100,7 +117,8 @@ fn main() {
             start_consumer,
             stop_consumer,
             produce,
-            setup_kafka
+            set_broker,
+            get_broker
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
