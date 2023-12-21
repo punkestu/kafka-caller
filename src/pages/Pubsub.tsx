@@ -5,11 +5,14 @@ import { Event, listen } from "@tauri-apps/api/event";
 
 export default function Pubsub() {
   const [topic, setTopic] = useState("");
+  const [errTopic, setErrTopic] = useState<string | null>(null);
   const [messages, setMessages] = useState<string[]>([]);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
-    invoke("start_consumer");
+    invoke("start_consumer", { topic })
+      .then(() => setErrTopic(null))
+      .catch((err) => setErrTopic(err));
     const unlisten = listen('kafka_message', (event: Event<string>) => {
       setMessages(current => [...current, event.payload]);
     });
@@ -19,6 +22,14 @@ export default function Pubsub() {
       unlisten.then(f => f());
     }
   }, []);
+
+  useEffect(() => {
+    invoke("stop_consumer").then(() => {
+      invoke("start_consumer", { topic })
+        .then(() => setErrTopic(null))
+        .catch((err) => setErrTopic(err));
+    });
+  }, [topic]);
 
   const produce = async () => {
     await invoke("produce", { message });
@@ -43,7 +54,7 @@ export default function Pubsub() {
     >
       <input
         type="text"
-        className="px-4 py-1 w-full h-[6%] rounded-md"
+        className={`px-4 py-1 w-full h-[6%] rounded-md ${errTopic ? "border-red-500 border-2" : ""}`}
         name="topic"
         id="topic"
         placeholder="Topic..."
